@@ -1,0 +1,16 @@
+# 生成キャッシュ (初回実行時に自動作成)
+match_cache.json
+encounters.json
+content.json
+agents.json
+maps.json
+region_cache.json
+weapons_vandal.json
+
+# ビルド成果物
+build/
+dist/
+__pycache__/
+*.spec
+*.exe
+*.zip
