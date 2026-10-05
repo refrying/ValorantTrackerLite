@@ -17,6 +17,7 @@ valorant-tracker-lite: Rank Yoinker互換の超軽量トラッカー (キー不�
 import base64
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -70,6 +71,21 @@ HISTORY_N = 10       # 取得する履歴数
 ACT_KD_N = 5         # Act KD計算に使う試合数 (直近N戦)
 FETCH_WORKERS = 8    # 並列取得数 (IO待ち用。上げすぎると429が出る)
 REQ_TIMEOUT = 6      # 1リクエストの上限秒。引っかかった取得は欠損値で即切上げ
+MEM_TTL = 600        # 同一起動中の使い回し秒 (MMR/履歴は試合中に変わらない)
+DETAIL_CACHE_MAX = 500  # match_cache.jsonの上限件数
+
+_MISS = object()
+_PUUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _slim_details(d):
+    """match-detailsからKDA計算に必要な部分だけ残す (570KB→数KB)"""
+    try:
+        players = d.get("players", []) if isinstance(d, dict) else []
+        return {"players": [{"subject": p.get("subject", p.get("Subject")),
+                             "stats": p.get("stats", {})} for p in players]}
+    except Exception:
+        return d
 
 if getattr(sys, "frozen", False):
     # exe化時: キャッシュ類はAPPDATAに保存 (Desktopを汚さない)
@@ -103,7 +119,7 @@ def print_banner():
     print(f"{BOLD}{BANNER}{RESET}", flush=True)
 
 
-VLT_VERSION = "1.5.1"
+VLT_VERSION = "1.5.2"
 
 
 # ---------------- lockfile / log ----------------
@@ -228,6 +244,19 @@ class ValoClient:
         }
         self.cache = self._load_cache()
         self._tls = threading.local()  # スレッド毎のkeep-aliveセッション用
+        self._mem = {}  # 同一起動中の使い回し (mmr/history/streak)
+        self._mem_lock = threading.Lock()
+
+    def _mem_get(self, key):
+        with self._mem_lock:
+            e = self._mem.get(key)
+            if e is not None and time.time() - e[0] < MEM_TTL:
+                return e[1]
+        return _MISS
+
+    def _mem_set(self, key, value):
+        with self._mem_lock:
+            self._mem[key] = (time.time(), value)
 
     def _entitlements(self):
         r = requests.get(self.base_local + "/entitlements/v1/token",
@@ -318,12 +347,18 @@ class ValoClient:
     def _load_cache(self):
         try:
             with open(CACHE_FILE, encoding="utf-8") as f:
-                return json.load(f)
+                d = json.load(f)
+            # 旧形式の肥大ボディは読み込み時に削減
+            return {k: _slim_details(v) for k, v in d.items()} if isinstance(d, dict) else {}
         except Exception:
             return {}
 
     def _save_cache(self):
         try:
+            if len(self.cache) > DETAIL_CACHE_MAX:  # 肥大防止
+                drop = len(self.cache) - DETAIL_CACHE_MAX
+                for k in list(self.cache.keys())[:drop]:
+                    del self.cache[k]
             with open(CACHE_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.cache, f)
         except Exception:
@@ -395,7 +430,14 @@ class ValoClient:
                     "agent": p.get("CharacterID", "") or "",
                     "level": (p.get("PlayerIdentity") or {}).get("AccountLevel")}
 
-        return [conv(p, "Ally") for p in ally] + [conv(p, "Enemy") for p in enemy]
+        out = [conv(p, "Ally") for p in ally] + [conv(p, "Enemy") for p in enemy]
+        # 最終手段: TeamMatchToken(JWT)の参加者IDから漏れを補完
+        known = {p["puuid"] for p in out}
+        for s in token_puuids(d.get("TeamMatchToken")):
+            if s not in known:
+                out.append({"puuid": s, "team": "Enemy", "agent": "", "level": None})
+                known.add(s)
+        return out
 
     def pregame_count(self, mid):
         """pregameのユニーク人数。敵後出し検出用 (本家は状態変化時のみ再取得)"""
@@ -428,8 +470,17 @@ class ValoClient:
                         "level": (p.get("PlayerIdentity") or {}).get("AccountLevel")})
         return out
 
-    # --- rank / names / history ---
+    # --- rank / names / history (同一起動中は使い回し。試合中に変わらないため) ---
     def mmr(self, puuid):
+        key = f"mmr:{puuid}"
+        hit = self._mem_get(key)
+        if hit is not _MISS:
+            return hit
+        res = self._mmr_fetch(puuid)
+        self._mem_set(key, res)
+        return res
+
+    def _mmr_fetch(self, puuid):
         try:
             d = self.g(self.pd, f"/mmr/v1/players/{puuid}")
         except Exception:
@@ -483,6 +534,15 @@ class ValoClient:
             return {p: p[:8] for p in puuids}
 
     def history(self, puuid):
+        key = f"hist:{puuid}"
+        hit = self._mem_get(key)
+        if hit is not _MISS:
+            return hit
+        res = self._history_fetch(puuid)
+        self._mem_set(key, res)
+        return res
+
+    def _history_fetch(self, puuid):
         try:
             d = self.g(self.pd, f"/match-history/v1/history/{puuid}?startIndex=0&endIndex={HISTORY_N}")
         except Exception:
@@ -490,6 +550,16 @@ class ValoClient:
         return (d or {}).get("History", []) if d else []
 
     def streak(self, puuid, n=8):
+        """直近コンペの連勝/連敗を W3 / L2 形式で返す。不明時は -"""
+        key = f"streak:{puuid}:{n}"
+        hit = self._mem_get(key)
+        if hit is not _MISS:
+            return hit
+        res = self._streak_fetch(puuid, n)
+        self._mem_set(key, res)
+        return res
+
+    def _streak_fetch(self, puuid, n=8):
         """直近コンペの連勝/連敗を W3 / L2 形式で返す。不明時は -"""
         try:
             d = self.g(self.pd, f"/mmr/v1/players/{puuid}/competitiveupdates"
@@ -526,8 +596,8 @@ class ValoClient:
         except Exception:
             return None
         if d:
-            self.cache[mid] = d
-        return d
+            self.cache[mid] = _slim_details(d)
+        return self.cache.get(mid)
 
     @staticmethod
     def kd_of(details, puuid):
@@ -569,6 +639,33 @@ def hget(h, *names):
         if n.lower() in low:
             return low[n.lower()]
     return None
+
+
+def token_puuids(token):
+    """TeamMatchToken(JWT)の参加者IDを抜く。EnemyTeam非表示時の補完用"""
+    try:
+        parts = (token or "").split(".")
+        if len(parts) < 2:
+            return []
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        d = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8", errors="ignore"))
+    except Exception:
+        return []
+    out = []
+
+    def walk(o):
+        if isinstance(o, str):
+            if _PUUID_RE.fullmatch(o):
+                out.append(o.lower())
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+        elif isinstance(o, dict):
+            for x in o.values():
+                walk(x)
+
+    walk(d)
+    return out
 
 
 def player_stats(cli, puuid, season=None):
