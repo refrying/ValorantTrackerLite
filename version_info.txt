@@ -1,7 +1,7 @@
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 0, 0),
-    prodvers=(1, 0, 0, 0),
+    filevers=(1, 6, 0, 0),
+    prodvers=(1, 6, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
           '040904B0',
           [StringStruct('CompanyName', '#2009 GEN'),
            StringStruct('FileDescription', 'ValorantTrackerLite - lightweight VALORANT match tracker'),
-           StringStruct('FileVersion', '1.0.0'),
+           StringStruct('FileVersion', '1.6.0'),
            StringStruct('InternalName', 'ValorantTrackerLite'),
            StringStruct('LegalCopyright', '#2009 GEN'),
            StringStruct('OriginalFilename', 'ValorantTrackerLite.exe'),
            StringStruct('ProductName', 'ValorantTrackerLite'),
-           StringStruct('ProductVersion', '1.0.0')])
+           StringStruct('ProductVersion', '1.6.0')])
       ]
     ),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])

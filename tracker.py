@@ -24,6 +24,7 @@ import time
 import unicodedata
 import urllib3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -119,7 +120,7 @@ def print_banner():
     print(f"{BOLD}{BANNER}{RESET}", flush=True)
 
 
-VLT_VERSION = "1.5.2"
+VLT_VERSION = "1.6.0"
 
 
 # ---------------- lockfile / log ----------------
@@ -493,14 +494,24 @@ class ValoClient:
             latest = d.get("LatestCompetitiveUpdate") or {}
             season = latest.get("SeasonID")
             q = (d.get("QueueSkills") or {}).get("competitive") or {}
-            info = (q.get("SeasonalInfoBySeasonID") or {}).get(season or "", {})
+            infos = q.get("SeasonalInfoBySeasonID") or {}
+            low = {str(k).lower(): k for k in infos}
+            # Act切替直後はLatestCompetitiveUpdateが旧Actを指したままなので現行Act側を優先
+            try:
+                cur = current_act_id(content_seasons(self))
+            except Exception:
+                cur = None
+            if cur:
+                cur = str(cur).lower()
+                if cur in low and low[cur] != season:
+                    season = low[cur]
+            info = infos.get(season or "", {})
             tier = info.get("CompetitiveTier", 0)
             rr = info.get("RankedRating", 0)
             # 最高ランク: 全シーズンのWinsByTierの最大値 (本家と同方式)
             peak_tier, peak_season = tier, season
             try:
                 best = -1
-                infos = q.get("SeasonalInfoBySeasonID") or {}
                 for sid, sinfo in infos.items():
                     wins = (sinfo or {}).get("WinsByTier")
                     if not wins:
@@ -668,7 +679,7 @@ def token_puuids(token):
     return out
 
 
-def player_stats(cli, puuid, season=None):
+def player_stats(cli, puuid):
     hist = cli.history(puuid) or []
     prev_kda, act_kd, kd_num, kd_n = "-", "-", 0.0, 0
     # 前試合: 直近1件
@@ -679,15 +690,22 @@ def player_stats(cli, puuid, season=None):
             kd = cli.kd_of(det, puuid)
             if kd:
                 prev_kda = f"{kd[0]}/{kd[1]}/{kd[2]}"
-    # 今Act: 直近コンペのシーズン(=現Act)を基準に直近ACT_KD_N戦で平均
+    # 今Act: content-serviceの現行Actから判定 (Act切替直後でも正しく出る)
+    cur_season = None
+    try:
+        cur_season = current_act_id(content_seasons(cli))
+    except Exception:
+        cur_season = None
     comp = [h for h in hist
             if "compet" in str(hget(h, "QueueID", "QueueId", "queueID") or "").lower()]
-    cur_season = hget(comp[0], "SeasonID", "SeasonId", "seasonID") if comp else None
+    if not cur_season:
+        cur_season = hget(comp[0], "SeasonID", "SeasonId", "seasonID") if comp else None
+    cur_low = str(cur_season or "").lower()
     tk = td = n = 0
     for h in comp:
         if n >= ACT_KD_N:
             break
-        if cur_season and hget(h, "SeasonID", "SeasonId", "seasonID") != cur_season:
+        if cur_low and str(hget(h, "SeasonID", "SeasonId", "seasonID") or "").lower() != cur_low:
             continue
         mid = hget(h, "MatchID", "MatchId", "matchID") or ""
         det = cli.details(mid) if mid else None
@@ -799,30 +817,66 @@ def smurf_mark(level, tier, kd_num, kd_n):
 
 
 # ---------------- peak rank (最高ランク+時期) ----------------
+_seasons_mem = [0.0, None]  # プロセス内メモ (5分) スレッド併用でもshared CDNに1回だけ
+
+
+def _iso_to_ts(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+
 def content_seasons(cli, max_age_days=3):
-    """content-serviceのシーズン一覧。キャッシュ優先 (3日で更新)"""
+    """content-serviceのシーズン一覧。現行Act判定に日付が要るため保持する"""
+    now = time.time()
+    if now - _seasons_mem[0] < 300 and _seasons_mem[1]:
+        return _seasons_mem[1]
+    seasons = []
     try:
         with open(CONTENT_FILE, encoding="utf-8") as f:
             d = json.load(f)
-        if time.time() - d.get("time", 0) < max_age_days * 86400 and d.get("seasons"):
-            return d["seasons"]
+        seasons = d.get("seasons") or []
+        # 旧形式 (日付なし) はAct判定に使えないので再取得
+        has_dates = bool(seasons) and any("start" in s for s in seasons[:3])
+        if has_dates and now - d.get("time", 0) < max_age_days * 86400:
+            _seasons_mem[:] = [now, seasons]
+            return seasons
     except Exception:
-        pass
+        seasons = []
     try:
         d = cli.g(f"https://shared.{cli.pd_region}.a.pvp.net", "/content-service/v3/content")
-        seasons = [{"ID": s.get("ID"), "Name": s.get("Name"), "Type": s.get("Type")}
+        fetched = [{"ID": s.get("ID"), "Name": s.get("Name"), "Type": s.get("Type"),
+                    "start": _iso_to_ts(s.get("assetStartDate")),
+                    "end": _iso_to_ts(s.get("assetEndDate"))}
                    for s in (d or {}).get("Seasons", [])]
-        if seasons:
-            with open(CONTENT_FILE, "w", encoding="utf-8") as f:
-                json.dump({"time": time.time(), "seasons": seasons}, f)
+        if fetched:
+            seasons = fetched
+            _seasons_mem[:] = [now, seasons]
+            try:
+                with open(CONTENT_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"time": now, "seasons": seasons}, f)
+            except Exception:
+                pass
             return seasons
     except Exception:
         pass
-    try:
-        with open(CONTENT_FILE, encoding="utf-8") as f:
-            return json.load(f).get("seasons", [])
-    except Exception:
-        return []
+    if seasons:
+        _seasons_mem[:] = [now, seasons]
+        return seasons
+    return []
+
+
+def current_act_id(seasons):
+    """今やっているActのシーズンID。Act切替直後の判定に使う"""
+    now = time.time()
+    for s in seasons or []:
+        if s.get("Type") != "act":
+            continue
+        st, en = s.get("start"), s.get("end")
+        if isinstance(st, (int, float)) and isinstance(en, (int, float)) and st <= now <= en:
+            return s.get("ID")
+    return None
 
 
 def _roman(tok):
@@ -1152,7 +1206,7 @@ def build_rows(cli, phase, mid, players, agents):
         """重い取得だけ先行 (名前解決・見た目の組立ては後で一括)"""
         try:
             m = cli.mmr(p["puuid"])
-            prev_kda, act_kd, kd_num, kd_n = player_stats(cli, p["puuid"], m["season"])
+            prev_kda, act_kd, kd_num, kd_n = player_stats(cli, p["puuid"])
             streak = cli.streak(p["puuid"])
             tick(f"{p['puuid'][:8]} {m['rank']} ActKD={act_kd} Prev={prev_kda}" if VERBOSE else "")
             return (p, m, prev_kda, act_kd, kd_num, kd_n, streak)
@@ -1243,6 +1297,7 @@ def main():
     else:
         log("websocket-clientが無いためポーリングのみ (pip install websocket-client)")
     last_mid = None
+    last_phase = None
     fail_count = 0
     pregame_since = None
     pregame_diag_done = False
@@ -1277,11 +1332,12 @@ def main():
                     if last_mid != "MENU":
                         log("待機中: エージェント選択/試合開始を待っています…")
                         last_mid = "MENU"
+                    last_phase = "MENU"
                     pregame_since = None
                     pregame_count = None
                     wait_awhile()
                     continue
-                if mid == last_mid:
+                if mid == last_mid and phase == last_phase:
                     if phase == "PREGAME":
                         # 敵後出し等で人数が増えたら再取得
                         try:
@@ -1315,10 +1371,14 @@ def main():
                         wait_awhile()
                         continue
                 pregame_since = None
-                last_mid = mid
                 log(f"{phase}検出 ({mid[:8]}…)、情報を取得します…")
                 n_fetched = run_once_inner(cli, phase, mid)
                 pregame_count = n_fetched if phase == "PREGAME" else None
+                last_mid, last_phase = mid, phase
+                if n_fetched == 0:
+                    # 試合開始直後でrosterが取れないことがある → 次回もう一度
+                    last_mid = None
+                    log("プレイヤー一覧が空です。再取得します")
         except KeyboardInterrupt:
             print("\n終了します。")
             try:
