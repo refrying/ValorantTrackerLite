@@ -74,6 +74,7 @@ FETCH_WORKERS = 8    # 並列取得数 (IO待ち用。上げすぎると429が�
 REQ_TIMEOUT = 6      # 1リクエストの上限秒。引っかかった取得は欠損値で即切上げ
 MEM_TTL = 600        # 同一起動中の使い回し秒 (MMR/履歴は試合中に変わらない)
 DETAIL_CACHE_MAX = 500  # match_cache.jsonの上限件数
+STATIC_TTL_DAYS = 1  # 静的データ(agents/maps/weapons)のキャッシュ寿命。新エージェント等の追従用
 
 _MISS = object()
 _PUUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
@@ -120,7 +121,7 @@ def print_banner():
     print(f"{BOLD}{BANNER}{RESET}", flush=True)
 
 
-VLT_VERSION = "1.6.0"
+VLT_VERSION = "1.6.1"
 
 
 # ---------------- lockfile / log ----------------
@@ -623,21 +624,46 @@ class ValoClient:
 
 
 # ---------------- agents ----------------
-def agent_short_map():
-    if os.path.exists(AGENT_FILE):
-        try:
-            with open(AGENT_FILE, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+def _read_json_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_json_file(path, data):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def _fresh_file(path, ttl_days=STATIC_TTL_DAYS):
+    """静的キャッシュが期限内ならTrue (新エージェント等の追従用)"""
+    try:
+        return time.time() - os.path.getmtime(path) < ttl_days * 86400
+    except OSError:
+        return False
+
+
+def agent_short_map(refresh=False):
+    """{agent uuid: 表示名}。TTL期限切れか明示指定時のみ取り直す"""
+    if not refresh and _fresh_file(AGENT_FILE):
+        m = _read_json_file(AGENT_FILE)
+        if m:
+            return m
     try:
         r = requests.get("https://valorant-api.com/v1/agents?isPlayableCharacter=true", timeout=15)
         m = {a["uuid"].lower(): a["displayName"] for a in r.json()["data"]}
-        with open(AGENT_FILE, "w", encoding="utf-8") as f:
-            json.dump(m, f, ensure_ascii=False)
-        return m
+        if m:
+            _write_json_file(AGENT_FILE, m)
+            return m
     except Exception:
-        return {}
+        pass
+    return _read_json_file(AGENT_FILE) or {}  # 通信失敗時は古いキャッシュで封じる
 
 
 # ---------------- stats ----------------
@@ -729,13 +755,16 @@ SKIN_SOCKET = "bcef87d6-209b-46c6-8b19-fbe40bd95abc"  # 本家準拠のスキン
 VERBOSE = "--verbose" in sys.argv
 QUIET = "--quiet" in sys.argv
 
+# 新エージェント/新スキンを検出した時に1回だけキャッシュを取り直すフラグ
+_AGENT_REFRESHED = False
+_SKIN_REFRESHED = False
 
-def vandal_skin_map():
-    """(vandalのweapon uuid, {skin uuid: (短縮名, tier色hex)}) を返す。キャッシュ優先"""
-    if os.path.exists(WEAPON_FILE):
-        try:
-            with open(WEAPON_FILE, encoding="utf-8") as f:
-                d = json.load(f)
+
+def vandal_skin_map(refresh=False):
+    """(vandalのweapon uuid, {skin uuid: (短縮名, tier色hex)}) を返す。TTL付きキャッシュ優先"""
+    if not refresh and _fresh_file(WEAPON_FILE):
+        d = _read_json_file(WEAPON_FILE)
+        if d and d.get("vandal_uuid") and d.get("skins"):
             skins = {}
             for k, v in d["skins"].items():
                 if isinstance(v, str):  # 旧形式 {uuid: 名前}
@@ -743,8 +772,6 @@ def vandal_skin_map():
                 else:
                     skins[k] = (v.get("name", "?"), v.get("color"))
             return d["vandal_uuid"], skins
-        except Exception:
-            pass
     try:
         tier_colors = {}
         try:
@@ -766,16 +793,26 @@ def vandal_skin_map():
                     color = tier_colors.get((s.get("contentTierUuid") or "").lower())
                     skins[s["uuid"].lower()] = {"name": name, "color": color}
                 d = {"vandal_uuid": w["uuid"].lower(), "skins": skins}
-                with open(WEAPON_FILE, "w", encoding="utf-8") as f:
-                    json.dump(d, f, ensure_ascii=False)
+                _write_json_file(WEAPON_FILE, d)
                 return d["vandal_uuid"], {k: (v["name"], v["color"]) for k, v in skins.items()}
     except Exception:
         pass
+    # 通信失敗時は古いキャッシュで封じる
+    d = _read_json_file(WEAPON_FILE)
+    if d and d.get("vandal_uuid") and d.get("skins"):
+        skins = {}
+        for k, v in d["skins"].items():
+            if isinstance(v, str):
+                skins[k] = (v, None)
+            else:
+                skins[k] = (v.get("name", "?"), v.get("color"))
+        return d["vandal_uuid"], skins
     return None, {}
 
 
 def match_vandal_skins(cli, phase, mid):
     """マッチの装備から {puuid小文字: (Vandalスキン名, tier色hex)} を返す。1リクエストのみ"""
+    global _SKIN_REFRESHED
     try:
         ep = (f"/pregame/v1/matches/{mid}/loadouts" if phase == "PREGAME"
               else f"/core-game/v1/matches/{mid}/loadouts")
@@ -784,7 +821,7 @@ def match_vandal_skins(cli, phase, mid):
         vandal_uuid, skin_names = vandal_skin_map()
         if not vandal_uuid:
             return {}
-        out = {}
+        found = {}  # subj小文字 -> スキンuuid小文字
         for e in entries:
             subj = (e.get("Subject") or "").lower()
             if not subj:
@@ -795,11 +832,15 @@ def match_vandal_skins(cli, phase, mid):
                 if str(wuuid).lower() != vandal_uuid:
                     continue
                 try:
-                    sid = w["Sockets"][SKIN_SOCKET]["Item"]["ID"]
+                    sid = str(w["Sockets"][SKIN_SOCKET]["Item"]["ID"]).lower()
                 except (KeyError, TypeError):
                     continue
-                out[subj] = skin_names.get(str(sid).lower(), ("?", None))
-        return out
+                found[subj] = sid
+        # 新スキン (キャッシュ未登録) は1回だけ取り直す
+        if found and not _SKIN_REFRESHED and any(sid not in skin_names for sid in found.values()):
+            _SKIN_REFRESHED = True
+            _, skin_names = vandal_skin_map(refresh=True)
+        return {subj: skin_names.get(sid, ("?", None)) for subj, sid in found.items()}
     except Exception:
         return {}
 
@@ -1086,20 +1127,16 @@ def display_name(raw, agent):
 
 
 def map_name_map():
-    if os.path.exists(MAP_FILE):
+    if not _fresh_file(MAP_FILE):
         try:
-            with open(MAP_FILE, encoding="utf-8") as f:
-                return json.load(f)
+            r = requests.get("https://valorant-api.com/v1/maps", timeout=15)
+            m = {a["mapUrl"]: a["displayName"] for a in r.json()["data"]}
+            if m:
+                _write_json_file(MAP_FILE, m)
+                return m
         except Exception:
             pass
-    try:
-        r = requests.get("https://valorant-api.com/v1/maps", timeout=15)
-        m = {a["mapUrl"]: a["displayName"] for a in r.json()["data"]}
-        with open(MAP_FILE, "w", encoding="utf-8") as f:
-            json.dump(m, f, ensure_ascii=False)
-        return m
-    except Exception:
-        return {}
+    return _read_json_file(MAP_FILE) or {}  # 通信失敗時は古いキャッシュ
 
 
 def match_map_name(cli, phase, mid):
@@ -1187,6 +1224,13 @@ def show(rows, phase, mid, me=None, map_name=""):
 
 
 def build_rows(cli, phase, mid, players, agents):
+    global _AGENT_REFRESHED
+    # 新実装エージェント (キャッシュ未登録) は1回だけ取り直す
+    if not _AGENT_REFRESHED and any(
+            p.get("agent") and p["agent"].lower() not in agents for p in players):
+        _AGENT_REFRESHED = True
+        log("未登録のエージェントを検出、一覧を更新します…")
+        agents = agent_short_map(refresh=True)
     total = len(players)
     done = [0]
     lock = threading.Lock()
