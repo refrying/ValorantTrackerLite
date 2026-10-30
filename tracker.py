@@ -18,6 +18,7 @@ import base64
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -121,7 +122,8 @@ def print_banner():
     print(f"{BOLD}{BANNER}{RESET}", flush=True)
 
 
-VLT_VERSION = "1.6.1"
+VLT_VERSION = "1.6.2"
+REPO = "refrying/ValorantTrackerLite"  # 自己更新の取得先
 
 
 # ---------------- lockfile / log ----------------
@@ -754,6 +756,7 @@ WEAPON_FILE = os.path.join(BASE_DIR, "weapons_vandal.json")
 SKIN_SOCKET = "bcef87d6-209b-46c6-8b19-fbe40bd95abc"  # 本家準拠のスキンソケット
 VERBOSE = "--verbose" in sys.argv
 QUIET = "--quiet" in sys.argv
+NO_UPDATE = "--no-update" in sys.argv  # 起動時の自己更新チェックを無効化
 
 # 新エージェント/新スキンを検出した時に1回だけキャッシュを取り直すフラグ
 _AGENT_REFRESHED = False
@@ -1299,6 +1302,115 @@ def build_rows(cli, phase, mid, players, agents):
     return rows
 
 
+# ---------------- self-update ----------------
+def _ver_tuple(v):
+    """'v1.6.2' 等を (1, 6, 2) に。解釈不能は (0, 0, 0) (= 更新しない)"""
+    nums = re.findall(r"\d+", str(v))[:3]
+    return tuple(int(n) for n in nums) if len(nums) == 3 else (0, 0, 0)
+
+
+def _rm(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def cleanup_update_leftovers():
+    """差し替え後の旧exe(.old)を掃除。失敗しても続行"""
+    base = (os.path.abspath(sys.executable) if getattr(sys, "frozen", False)
+            else os.path.abspath(__file__))
+    _rm(base + ".old")  # .new は後続の同時差し替えの邪魔をしないよう触らない
+
+
+def check_latest_release():
+    """現バージョンより新しいリリースがあれば (タグ, assets) を返す。オフライン等はNone"""
+    try:
+        r = requests.get(f"https://api.github.com/repos/{REPO}/releases/latest",
+                         timeout=6, headers={"User-Agent": f"ValorantTrackerLite/{VLT_VERSION}"})
+        if r.status_code != 200:
+            return None
+        d = r.json() or {}
+        tag = str(d.get("tag_name", ""))
+        if not tag or _ver_tuple(tag) <= _ver_tuple(VLT_VERSION):
+            return None
+        return tag, d.get("assets") or []
+    except Exception:
+        return None
+
+
+def _download_to(url, path):
+    """exeアセットをダウンロードし、実行ファイルらしい容姿ならTrue"""
+    try:
+        r = requests.get(url, timeout=120, stream=True,
+                         headers={"User-Agent": f"ValorantTrackerLite/{VLT_VERSION}"})
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(65536):
+                if chunk:
+                    f.write(chunk)
+        with open(path, "rb") as f:
+            head = f.read(2)
+        return head == b"MZ" and os.path.getsize(path) > 5 * 1024 * 1024
+    except Exception:
+        return False
+
+
+def _delayed_replace(new_path, exe_path):
+    """自分の終了後に差し替える (実行中exeが掴まれている環境用)"""
+    cmd = f'timeout /t 2 /nobreak >nul & move /y "{new_path}" "{exe_path}"'
+    try:
+        subprocess.Popen(["cmd", "/c", cmd], creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception:
+        pass
+
+
+def maybe_self_update():
+    """新リリースなら本体を差し替えて再起動。失敗時はリンクを出して続行"""
+    rel = check_latest_release()
+    if not rel:
+        return
+    tag, assets = rel
+    log(f"新バージョン {tag} があります。更新します…")
+    if getattr(sys, "frozen", False):
+        exe_path = os.path.abspath(sys.executable)
+        new_path, old_path = exe_path + ".new", exe_path + ".old"
+        url = next((a["browser_download_url"] for a in assets
+                    if str(a.get("name", "")).lower().endswith(".exe")), None)
+        if not url or not _download_to(url, new_path):
+            _rm(new_path)
+            log(f"更新に失敗。手動: https://github.com/{REPO}/releases")
+            return
+        _rm(old_path)
+        try:
+            os.rename(exe_path, old_path)   # 実行中exeのリネームは可能
+            os.rename(new_path, exe_path)
+        except OSError:
+            _delayed_replace(new_path, exe_path)
+            log(f"{tag} は次回起動時に反映されます")
+            sys.exit(0)
+        log(f"{tag} に更新しました。再起動します…")
+        time.sleep(0.5)
+        try:
+            subprocess.Popen([exe_path] + sys.argv[1:], cwd=os.path.dirname(exe_path))
+        except OSError:
+            pass
+        sys.exit(0)
+    # スクリプト実行: 同タグのtracker.pyを上書き (実行中でも差し替え可)
+    try:
+        r = requests.get(f"https://raw.githubusercontent.com/{REPO}/{tag}/tracker.py",
+                         timeout=15, headers={"User-Agent": f"ValorantTrackerLite/{VLT_VERSION}"})
+        body = r.content.decode("utf-8")
+        if 'VLT_VERSION = "' not in body:
+            raise ValueError("取得した内容が不正")
+        with open(os.path.abspath(__file__), "w", encoding="utf-8", newline="") as f:
+            f.write(body)
+        log(f"{tag} に更新しました。再起動すると反映されます")
+    except Exception:
+        log(f"更新に失敗。手動: https://github.com/{REPO}/releases")
+
+
 def run_once():
     try:
         cli = ValoClient()
@@ -1330,6 +1442,9 @@ def run_once():
 def main():
     print_banner()
     log(f"ValorantTrackerLite v{VLT_VERSION}")
+    cleanup_update_leftovers()
+    if not NO_UPDATE:
+        maybe_self_update()
     once = "--once" in sys.argv
     if once:
         run_once()
