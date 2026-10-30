@@ -37,6 +37,9 @@ try:
 except Exception:
     pass
 
+import warnings as _warnings
+_warnings.filterwarnings("ignore", message=".*character detection dependency.*")
+
 if os.name == "nt":
     # 他PCのロケールに依存せずUTF-8出力 (文字化け対策)
     try:
@@ -1318,10 +1321,18 @@ def _rm(path):
 
 
 def cleanup_update_leftovers():
-    """差し替え後の旧exe(.old)を掃除。失敗しても続行"""
+    """差し替え後の旧exe(.old)を掃除。直後は実行中プロセス/AVスキャンが掴む事があるので少し慣らす"""
     base = (os.path.abspath(sys.executable) if getattr(sys, "frozen", False)
             else os.path.abspath(__file__))
-    _rm(base + ".old")  # .new は後続の同時差し替えの邪魔をしないよう触らない
+    old = base + ".old"
+    for _ in range(4):
+        if not os.path.exists(old):
+            return
+        try:
+            os.remove(old)
+            return
+        except OSError:
+            time.sleep(0.4)
 
 
 def check_latest_release():
@@ -1393,7 +1404,11 @@ def maybe_self_update():
         log(f"{tag} に更新しました。再起動します…")
         time.sleep(0.5)
         try:
-            subprocess.Popen([exe_path] + sys.argv[1:], cwd=os.path.dirname(exe_path))
+            # PyInstaller内部変数(_PYI*/_MEI*)を引き継ぐと子の起動が乱れるので落とす
+            env = {k: v for k, v in os.environ.items()
+                   if not k.startswith(("_PYI", "_MEI"))}
+            subprocess.Popen([exe_path] + sys.argv[1:],
+                             cwd=os.path.dirname(exe_path), env=env)
         except OSError:
             pass
         sys.exit(0)
